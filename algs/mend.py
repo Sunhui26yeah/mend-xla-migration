@@ -79,24 +79,34 @@ class GradientTransform(nn.Module):
         v_ = v.view(-1, v.shape[-1])
 
         nz_mask = (u_ != 0).any(-1) * (v_ != 0).any(-1)  # Skip batch elements with zero grad
-        u_ = u_[nz_mask]
-        v_ = v_[nz_mask]
+        # XLA: keep static shapes. Rows with zero grad stay in the tensors but are excluded from the
+        # running statistics and zeroed in the outputs, which equals dropping them.
+        w = nz_mask.to(u_.dtype).unsqueeze(-1)
 
         if self.training:
-            for idx in range(u_.shape[0]):
-                if not self.norm_init:
-                    self.u_mean = u_[idx].clone().detach()
-                    self.v_mean = v_[idx].clone().detach()
-                    self.u_s.zero_()
-                    self.v_s.zero_()
-                    self.k[:] = 1
-                    self.norm_init = True
-                else:
-                    self.k += 1
-                    self.u_mean, self.u_s = update_counter(u_[idx], self.u_mean, self.u_s, self.k)
-                    self.v_mean, self.v_s = update_counter(v_[idx], self.v_mean, self.v_s, self.k)
+            first = not self.norm_init
+            if first:
+                # Starting from an empty count is equivalent to initializing with the first row
+                self.u_mean = torch.zeros_like(self.u_mean)
+                self.v_mean = torch.zeros_like(self.v_mean)
+                self.u_s.zero_()
+                self.v_s.zero_()
+                self.k.zero_()
+                self.norm_init = True
+            # Batched form of the per-row Welford updates (update_counter): same mean and sum of squares
+            n = w.sum()
+            k_new = self.k + n
+            frac = n / k_new.clamp(min=1)
+            u_bmean = (u_ * w).sum(0) / n.clamp(min=1)
+            v_bmean = (v_ * w).sum(0) / n.clamp(min=1)
+            u_delta, v_delta = u_bmean - self.u_mean, v_bmean - self.v_mean
+            self.u_s = self.u_s + (((u_ - u_bmean) * w) ** 2).sum(0) + u_delta ** 2 * self.k * frac
+            self.v_s = self.v_s + (((v_ - v_bmean) * w) ** 2).sum(0) + v_delta ** 2 * self.k * frac
+            self.u_mean = self.u_mean + u_delta * frac
+            self.v_mean = self.v_mean + v_delta * frac
+            self.k = k_new
 
-            if self.k < 2:
+            if first and self.k.item() < 2:
                 raise RuntimeError(f"Can't perform normalization with only {self.k} samples so far")
             self.u_std = (self.u_s / (self.k - 1)) ** 0.5
             self.v_std = (self.v_s / (self.k - 1)) ** 0.5
@@ -108,12 +118,14 @@ class GradientTransform(nn.Module):
             u_input = u_
             v_input = v_
 
+        keep = nz_mask.unsqueeze(-1)
         if self.cfg.combine:
             output = self.mlp(torch.cat((u_input, v_input), -1), mode=param_idx)
             out1, out2 = output.split([u.shape[-1], v.shape[-1]], -1)
-            return out1, out2
+            return torch.where(keep, out1, 0.), torch.where(keep, out2, 0.)
         else:
-            return self.mlp1(u_input, mode=param_idx), self.mlp2(v_input, mode=param_idx)
+            out1, out2 = self.mlp1(u_input, mode=param_idx), self.mlp2(v_input, mode=param_idx)
+            return torch.where(keep, out1, 0.), torch.where(keep, out2, 0.)
 
 
 class MEND(EditableModel):
