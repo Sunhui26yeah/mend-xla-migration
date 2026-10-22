@@ -91,7 +91,7 @@ class Seq2SeqAugmentedKILT(Dataset):
             for k2, v2 in self.tok(
                 v1,
                 return_tensors="pt",
-                padding=True,
+                padding="max_length",  # static shapes on XLA (padded positions are masked everywhere)
                 max_length=self.max_length,
                 truncation=True,
             ).items()
