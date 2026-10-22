@@ -225,12 +225,13 @@ class MEND(EditableModel):
         info_dict = {}
         idx = 0
         for n, p in _inner_params(self.model.named_parameters(), self.config.model.inner_params):
-            info_dict[f"grad/true_mag{idx}"] = p.grad.norm(2).item()
-            info_dict[f"grad/pseudo_mag{idx}"] = mean_grads[n].norm(2).item()
-            info_dict[f"grad/true_std{idx}"] = p.grad.std().item()
-            info_dict[f"grad/pseudo_std{idx}"] = mean_grads[n].std().item()
-            info_dict[f"grad/diff{idx}"] = (p.grad - mean_grads[n]).norm(2).item()
-            info_dict[f"grad/cos{idx}"] = F.cosine_similarity(p.grad.reshape(-1), mean_grads[n].reshape(-1), dim=0).item()
+            # XLA: kept on device; the trainer reads all logged scalars back once per step
+            info_dict[f"grad/true_mag{idx}"] = p.grad.norm(2).detach()
+            info_dict[f"grad/pseudo_mag{idx}"] = mean_grads[n].norm(2).detach()
+            info_dict[f"grad/true_std{idx}"] = p.grad.std().detach()
+            info_dict[f"grad/pseudo_std{idx}"] = mean_grads[n].std().detach()
+            info_dict[f"grad/diff{idx}"] = (p.grad - mean_grads[n]).norm(2).detach()
+            info_dict[f"grad/cos{idx}"] = F.cosine_similarity(p.grad.reshape(-1), mean_grads[n].reshape(-1), dim=0).detach()
             idx += 1
 
         self.model.zero_grad()

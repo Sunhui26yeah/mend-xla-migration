@@ -6,6 +6,7 @@ import time
 import json
 
 import torch
+import torch_xla
 import torch_xla.core.xla_model as xm
 from torch.utils.data import Dataset
 from omegaconf import OmegaConf
@@ -230,8 +231,9 @@ class EditTrainer(BaseTrainer):
 
         l_total_edit = self.config.cedit * l_edit + self.config.cloc * l_loc
 
+        finite_flags = []
         if training:
-            safe_backward(l_total_edit, self.model.outer_parameters(), self.config.accumulate_bs)
+            finite_flags.append(safe_backward(l_total_edit, self.model.outer_parameters(), self.config.accumulate_bs))
 
         # Collect some useful metrics
         with torch.no_grad():
@@ -239,16 +241,17 @@ class EditTrainer(BaseTrainer):
             post_loc_dict = self.model.loc_loss_fn(post_base_logits, batch["loc"]["labels"])
             pre_loc_dict = self.model.loc_loss_fn(base_logits, batch["loc"]["labels"])
 
+        # XLA: logged scalars stay on device until the single readback at the end of the step
         info_dict = {}
-        info_dict['loss/edit'] = l_edit.item()
-        info_dict['loss/loc'] = l_loc.item()
-        info_dict['edit/acc'] = post_edit_dict["acc"].item()
-        info_dict['edit/log_prob'] = post_edit_dict["log_prob"].item()
-        info_dict['edit/prob'] = post_edit_dict["prob"].item()
-        info_dict["acc/pre"] = pre_loc_dict["acc"].item()
-        info_dict["acc/post"] = post_loc_dict["acc"].item()
-        info_dict["nll/pre"] = pre_loc_dict["nll"].item()
-        info_dict["nll/post"] = post_loc_dict["nll"].item()
+        info_dict['loss/edit'] = l_edit.detach()
+        info_dict['loss/loc'] = l_loc.detach()
+        info_dict['edit/acc'] = post_edit_dict["acc"]
+        info_dict['edit/log_prob'] = post_edit_dict["log_prob"]
+        info_dict['edit/prob'] = post_edit_dict["prob"]
+        info_dict["acc/pre"] = pre_loc_dict["acc"]
+        info_dict["acc/post"] = post_loc_dict["acc"]
+        info_dict["nll/pre"] = pre_loc_dict["nll"]
+        info_dict["nll/post"] = post_loc_dict["nll"]
         info_dict["n_tokens/pre"] = post_loc_dict["n_tokens"]
         info_dict["n_tokens/post"] = post_loc_dict["n_tokens"]
         info_dict["time/edit"] = edit_time
@@ -263,22 +266,32 @@ class EditTrainer(BaseTrainer):
             l_base = kl_loc_loss(original_logits.detach(), base_logits, mask=kl_mask.detach())
 
             if training:
-                safe_backward(l_base, self.model.outer_parameters(), self.config.accumulate_bs, allow_unused=True)
+                finite_flags.append(safe_backward(l_base, self.model.outer_parameters(), self.config.accumulate_bs, allow_unused=True))
 
-            info_dict['loss/base'] = l_base.item()
-            info_dict['nll/original'] = original_loc_dict["nll"].item()
-            info_dict['acc/original'] = original_loc_dict["acc"].item()
+            info_dict['loss/base'] = l_base.detach()
+            info_dict['nll/original'] = original_loc_dict["nll"]
+            info_dict['acc/original'] = original_loc_dict["acc"]
             info_dict["n_tokens/original"] = original_loc_dict["n_tokens"]
         else:
             l_base = torch.tensor(0.)
 
         l_total = l_total_edit + self.config.cbase * l_base
 
-        info_dict["loss/total"] = l_total.item()
-        info_dict["loss/total_edit"] = l_total_edit.item()
+        info_dict["loss/total"] = l_total.detach()
+        info_dict["loss/total_edit"] = l_total_edit.detach()
         info_dict["memory/alloc_max"] = torch.cuda.max_memory_allocated()
         info_dict["memory/res_max"] = torch.cuda.max_memory_reserved()
         info_dict = {**info_dict, **model_info}
+
+        # XLA: execute the step once, then read every logged scalar back in one transfer
+        keys = [k for k, v in info_dict.items() if isinstance(v, torch.Tensor)]
+        scalars = torch.stack([info_dict[k].detach().float().reshape(()).to(self.config.device) for k in keys] +
+                              [f.float() for f in finite_flags])
+        torch_xla.sync()
+        values = scalars.cpu().tolist()
+        info_dict.update(zip(keys, values[:len(keys)]))
+        if not all(values[len(keys):]):
+            LOG.info("Skipped grad accumulation because of non-finite gradients")
 
         return l_total, l_edit, l_loc, l_base, info_dict
 
@@ -297,8 +310,10 @@ class EditTrainer(BaseTrainer):
                 self.lr_opt.step()
                 self.lr_opt.zero_grad()
 
-                for lr_idx, lr in enumerate(self.model.edit_lrs):
-                    info_dict[f'lr/lr{lr_idx}'] = lr.item()
+            torch_xla.sync()
+            if self.lr_opt is not None:
+                for lr_idx, lr in enumerate(self.model.edit_lrs.detach().cpu().tolist()):
+                    info_dict[f'lr/lr{lr_idx}'] = lr
 
         return info_dict
 
