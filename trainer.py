@@ -15,6 +15,7 @@ import wandb
 
 from losses import kl_loc_loss
 import utils
+from xla_debug import log_xla_metrics, write_xla_report
 from utils import _logits, safe_backward, RunningStatAverager, EarlyStopper, formatted_timestamp, time_delta_seconds
 
 
@@ -140,10 +141,12 @@ class BaseTrainer:
                     averager.reset()
                     self.echo(global_iter, avg_info)
                     self.wandb_log(global_iter, avg_info)
+                    log_xla_metrics(global_iter)
 
             if global_iter % self.config.val_interval == 0:
                 val_info = self.validate(steps=self.config.val_steps)
                 self.echo(global_iter, val_info)
+                log_xla_metrics(global_iter)
                 self.wandb_log(global_iter, val_info)
 
                 if stopper.update(self.global_iter, val_info):
@@ -170,6 +173,8 @@ class BaseTrainer:
         val_steps = 200 if self.config.debug else None
         val_info = self.validate(log=True, steps=val_steps)
         self.echo(self.global_iter, val_info, pretty=True)
+        log_xla_metrics(self.global_iter)
+        write_xla_report()
         self.wandb_log(self.global_iter + self.config.val_interval, val_info)
 
         if self.config.results_dir is not None:
