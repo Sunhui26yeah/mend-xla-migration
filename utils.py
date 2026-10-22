@@ -77,23 +77,20 @@ def dict_to(d, device):
 def safe_backward(loss, parameters, accumulate=1, allow_unused=False):
     parameters = list(parameters)  # Capture the generator output
     grads = torch.autograd.grad(loss, parameters, allow_unused=allow_unused)
-    nan, inf = False, False
-    for g in grads:
-        if g is not None:
-            nan |= g.isnan().any().item()
-            inf |= g.isinf().any().item()
+    # XLA: decide on device (no per-tensor .item() syncs); returns the device flag so the
+    # caller can log a skipped accumulation after the step has been executed
+    finite = torch.stack([torch.isfinite(g).all() for g in grads if g is not None]).all()
 
-    if not (nan or inf):
-        for p, g in zip(parameters, grads):
-            if g is None:
-                continue
+    for p, g in zip(parameters, grads):
+        if g is None:
+            continue
 
-            if p.grad is None:
-                p.grad = g / accumulate
-            else:
-                p.grad += g / accumulate
-    else:
-        LOG.info(f"Skipping grad accumulation because inf: {inf} nan: {nan}")
+        if p.grad is None:
+            p.grad = torch.where(finite, g / accumulate, 0.)
+        else:
+            p.grad += torch.where(finite, g / accumulate, 0.)
+
+    return finite
 
 
 def _logits(x):
