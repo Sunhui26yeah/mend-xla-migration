@@ -6,6 +6,7 @@ import time
 import json
 
 import torch
+import torch_xla.core.xla_model as xm
 from torch.utils.data import Dataset
 from omegaconf import OmegaConf
 
@@ -106,7 +107,7 @@ class BaseTrainer:
             LOG.info(f"Moving old archive to {bk_path}")
             os.rename(self.save_path, bk_path)
 
-        torch.save(obj, self.save_path)
+        xm.save(obj, self.save_path)  # moves XLA tensors to CPU before torch.save
         LOG.info("Write complete.")
 
     def echo(self, train_step, info_dict, pretty=False):
@@ -159,7 +160,7 @@ class BaseTrainer:
 
         if not self.config.eval_only:
             if (not self.config.debug) or self.config.save:
-                archive = torch.load(self.save_path, map_location="cpu")
+                archive = torch.load(self.save_path, map_location="cpu", weights_only=False)  # archive holds the model config object
                 LOG.info(f"Loading best model from step {archive['step']}, elapsed time {archive['elapsed_time']}")
                 self.model.to("cpu")
                 self.model.load_state_dict(archive["model"])
