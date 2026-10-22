@@ -7,6 +7,7 @@ import hydra
 from omegaconf import OmegaConf
 import numpy as np
 import torch
+import torch_xla  # noqa: F401  (registers the 'xla' device used by config.device)
 import utils
 
 
